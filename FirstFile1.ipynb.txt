@@ -1,0 +1,199 @@
+# ==================================================
+# Julia + JuMP Optimization Template
+# ==================================================
+
+# Load necessary packages
+using Pkg
+
+# Install required packages if not already
+Pkg.activate(temp=true)   # use a temporary environment
+Pkg.add("JuMP")
+Pkg.add("HiGHS")           # HiGHS is an open-source solver for LP/MIP
+
+# Import
+using JuMP
+using HiGHS
+
+# ----------------- Parameters -----------------
+
+# Example parameters you will replace with your real ones
+T = 8                          # number of time periods (weeks)
+levels = 1:5                  # NPI levels
+regions = 25                  # for decentralized model; skip if centralized
+
+# Example “costs” for levels
+sev_cost = [0.014, 0.04, 0.073, 0.123, 0.27]
+
+# Other epidemic parameters (replace or expand as needed)
+beta_vec = [1.4, 1.4, 0.8, 1.0, 0.7, 0.7, 0.8, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 1.0, 0.7, 0.7, 0.7, 0.7, 0.7, 1.0, 0.7]
+phi = 1.0
+mu = 0.4
+gamma = 0.1
+rho = 0.1
+epsilon = 0.18
+alpha = [0.12,0.20,0.27,0.35,0.52]
+init_infected_frac = 1e-4
+critInf_frac = 1e-6
+
+# Population, capacity (for centralized you’ll sum them)
+P = [2480000,2443000,1296000,1501000,530000,780000,1147000,873000,676000,
+     626000,133000,114000,194000,98000,590000,752000,441000,1743000,849000,954000,
+     440000,895000,505000,1190000,898000]
+capacity = [93,42,22,49,14,15,31,19,18,20,5,6,6,4,18,27,11,43,14,28,14,26,11,28,18]
+
+P_total = sum(P)
+capacity_total = sum(capacity)
+beta_central = mean(beta_vec)
+
+# ----------------- Generate Sequences -----------------
+
+# Example: generate all non-increasing sequences of length T from levels
+function generate_nonincreasing(levels, T)
+    seqs = []
+    cur = zeros(Int, T)
+    function recurse(pos, maxAllowed)
+        if pos > T
+            push!(seqs, copy(cur))
+        else
+            for lv in maxAllowed:-1:minimum(levels)
+                cur[pos] = lv
+                recurse(pos+1, lv)
+            end
+        end
+    end
+    recurse(1, maximum(levels))
+    return seqs
+end
+
+# Example filter: at most 3 distinct levels, runs >= 2, etc.
+function runs_at_least_two(seq)
+    count = 1
+    for i = 2:length(seq)
+        if seq[i] == seq[i-1]
+            count += 1
+        else
+            if count < 2
+                return false
+            end
+            count = 1
+        end
+    end
+    return (count >= 2)
+end
+
+# Create filtered sequences
+all_seqs = generate_nonincreasing(levels, T)
+seqs = [s for s in all_seqs if length(unique(s)) <= 3 && runs_at_least_two(s)]
+println("Generated $(length(seqs)) feasible sequences.")
+
+# (Optional: print them)
+for (i, s) in enumerate(seqs)
+    println("Seq ", i, ": ", s)
+end
+
+# ----------------- Simulation Function -----------------
+
+# Simulate aggregated epidemic for a given sequence (centralized)
+function simulate_seq_agg(seq, beta, phi, mu, gamma, alpha, rho, epsilon, Ppop, init_frac, critInf_frac, T)
+    I = zeros(Float64, T+1)
+    C = zeros(Float64, T+1)
+    D = zeros(Float64, T+1)
+    newInf = zeros(Float64, T)
+    I[1] = Ppop * init_frac
+    C[1] = Ppop * critInf_frac
+    D[1] = 0.0
+    for t in 1:T
+        lvl = seq[t]
+        a = alpha[lvl]
+        newInf[t] = beta * (1 - a) * (1 - rho*epsilon) * I[t]
+        I[t+1] = I[t] + newInf[t] - mu*(1 - rho)*I[t] - rho*phi * I[t]
+        if I[t+1] < 0
+            I[t+1] = 0.0
+        end
+        C[t+1] = (1 - gamma) * C[t] + phi * I[t]
+        D[t+1] = D[t] + 0.02 * C[t]   # you can adjust death model
+    end
+    return I, C, D, newInf
+end
+
+# ----------------- Precompute outcomes -----------------
+
+S = length(seqs)
+infect = zeros(Float64, S)
+death = zeros(Float64, S)
+shortage = zeros(Float64, S)
+cost = zeros(Float64, S)
+trajectories = Vector{Any}(undef, S)
+
+for (i, s) in enumerate(seqs)
+    cost[i] = sum(sev_cost[s])   # adjust if index alignment differs
+    I, C, D, newInf = simulate_seq_agg(s, beta_central, phi, mu, gamma, alpha, rho, epsilon, P_total, init_infected_frac, critInf_frac, T)
+    infect[i] = sum(newInf)
+    death[i] = D[end]
+    shortage[i] = sum(max.(0, C .- capacity_total))
+    trajectories[i] = (I, C, D)
+end
+
+# ----------------- Budget constraint -----------------
+
+B_min_norm = minimum(sev_cost)
+B_max_norm = maximum(sev_cost)
+println("Normalized budget feasible range: [", B_min_norm, ", ", B_max_norm, "]")
+
+# Choose normalized budget
+B_norm = 0.20
+b_agg = B_norm * P_total * T
+println("Chosen B_norm = ", B_norm, " → Aggregate budget RHS = ", b_agg)
+
+# ----------------- Build ILP in JuMP -----------------
+
+model = Model(HiGHS.Optimizer)
+
+# Decision variable: select exactly one sequence among seqs
+@variable(model, y[1:S], Bin)
+@constraint(model, sum(y) == 1)
+
+# Budget constraint
+@constraint(model, sum(y[i] * (P_total * cost[i]) for i in 1:S) <= b_agg)
+
+# Objective: minimize total infections
+@objective(model, Min, sum(y[i] * infect[i] for i in 1:S))
+
+optimize!(model)
+
+# ----------------- Show results -----------------
+
+status = termination_status(model)
+println("Solver status: ", status)
+
+if status == MOI.OPTIMAL || status == MOI.FEASIBLE_POINT
+    obj = objective_value(model)
+    println("Optimal infections = ", obj)
+    for i in 1:S
+        if value(y[i]) ≥ 0.5
+            println("Selected sequence index: ", i, " sequence: ", seqs[i])
+            println("  Infections = ", infect[i], " Deaths = ", death[i], " Cost = ", cost[i])
+            break
+        end
+    end
+else
+    println("No optimal solution found.")
+end
+
+# ----------------- (Optional) Export trajectories and summary -----------------
+
+using DelimitedFiles
+
+# Summary file
+summary_data = [ (i, infect[i], death[i], cost[i]) for i=1:S ]
+writedlm("seq_summary.csv", summary_data, ',')
+
+# Trajectory for selected
+sel = findfirst(i -> value(y[i]) ≥ 0.5, 1:S)
+if sel !== nothing
+    I, C, D = trajectories[sel]
+    # Write I, C, D time series
+    traj_table = hcat( collect(0:T), I, C, D )
+    writedlm("chosen_trajectory.csv", traj_table, ',')
+end
+
